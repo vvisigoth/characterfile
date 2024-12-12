@@ -50,7 +50,7 @@ const parseJsonFromMarkdown = (text) => {
 const promptUser = async (question, defaultValue = '') => {
   // Add a newline before the prompt
   console.log();
-  
+
   const { answer } = await inquirer.prompt([
     {
       type: 'input',
@@ -119,7 +119,7 @@ const runChatCompletion = async (messages, useGrammar = false, model) => {
       logError(`HTTP error! status: ${response.status}`, errorData);
       throw new Error(`Anthropic API request failed with status: ${response.status}`);
     }
-  
+
     const data = await response.json();
     const content = data.content[0].text;
     const parsed = parseJsonFromMarkdown(content) || JSON.parse(content);
@@ -278,17 +278,21 @@ const buildConversationThread = async (tweet, tweets, accountData) => {
     (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
   );
 
+  // Ensure we have valid account data before using it
+  const displayName = accountData[0]?.account?.accountDisplayName || 'Unknown';
+  const username = accountData[0]?.account?.username || 'unknown';
+
   const conversationText = thread
     .map((t) => {
       const post = [];
-      post.push(`From: ${accountData[0].account.accountDisplayName} (@${accountData[0].account.username})`);
+      post.push(`From: ${displayName} (@${username})`);
       post.push(`Tweet ID: ${t.id_str}`);
       if (t.in_reply_to_status_id_str) {
         post.push(`In Reply To: ${t.in_reply_to_status_id_str}`);
       }
       post.push(`Timestamp: ${new Date(t.created_at).toLocaleString()}`);
       post.push(`Content:`);
-      post.push(t.full_text);
+      post.push(t.full_text || t.text);
       post.push("---");
       return post.join("\n");
     })
@@ -303,7 +307,7 @@ const chunkText = async (tweets, accountData, archivePath) => {
   const CHUNK_SIZE = 60000; // 50k tokens approx
 
   const cacheDir = path.join(tmpDir, 'cache', path.basename(archivePath, '.zip'));
-  
+
   if (!fs.existsSync(cacheDir)) {
     fs.mkdirSync(cacheDir, { recursive: true });
   }
@@ -407,6 +411,7 @@ process.on('unhandledRejection', (reason, promise) => {
 program
   .option('--openai <api_key>', 'OpenAI API key')
   .option('--claude <api_key>', 'Claude API key')
+  .option('--json', 'Input is a JSON file')
   .parse(process.argv);
 
 const limitConcurrency = async (tasks, concurrencyLimit) => {
@@ -453,10 +458,10 @@ const loadApiKey = (model) => {
 const getApiKey = async (model) => {
   const envKey = process.env[`${model.toUpperCase()}_API_KEY`];
   if (validateApiKey(envKey, model)) return envKey;
-  
+
   const cachedKey = loadApiKey(model);
   if (validateApiKey(cachedKey, model)) return cachedKey;
-  
+
   let newKey = '';
   while (!validateApiKey(newKey, model)) {
     newKey = await promptForApiKey(model);
@@ -467,7 +472,7 @@ const getApiKey = async (model) => {
 
 const validateApiKey = (apiKey, model) => {
   if (!apiKey) return false;
-  
+  //input path is a json file')
   if (model === 'openai') {
     return apiKey.trim().startsWith('sk-');
   } else if (model === 'claude') {
@@ -480,6 +485,14 @@ const promptForApiKey = async (model) => {
   return await promptUser(`Enter ${model.toUpperCase()} API key: `);
 };
 
+const promptForAccountData = async () => {
+  const accountDisplayName = await promptUser('Enter the account display name: ');
+  const username = await promptUser('Enter the account username (without @): ');
+  return {
+    accountDisplayName,
+    username
+  };
+};
 
 const resumeOrStartNewSession = async (projectCache, archivePath) => {
   if (projectCache.unfinishedSession) {
@@ -492,9 +505,12 @@ const resumeOrStartNewSession = async (projectCache, archivePath) => {
       clearGenerationCache(archivePath);
     }
   }
-  
+
   if (!projectCache.unfinishedSession) {
-    projectCache.model = await promptUser('Select model (openai/claude): ');
+    // Only prompt for model if it's not already set from command line flags
+    if (!projectCache.model) {
+      projectCache.model = await promptUser('Select model (openai/claude): ');
+    }
     projectCache.basicUserInfo = await promptUser('Enter additional user info that might help the summarizer (real name, nicknames and handles, age, past employment vs current, etc): ');
     projectCache.unfinishedSession = {
       currentChunk: 0,
@@ -502,7 +518,7 @@ const resumeOrStartNewSession = async (projectCache, archivePath) => {
       completed: false
     };
   }
-  
+
   return projectCache;
 };
 
@@ -520,78 +536,149 @@ const saveCharacterData = (character) => {
   console.log('Character data saved to character.json');
 };
 
+const clearCache = (archivePath) => {
+  const cacheDir = path.join(tmpDir, 'cache', path.basename(archivePath, '.zip'));
+  if (fs.existsSync(cacheDir)) {
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+    fs.mkdirSync(cacheDir, { recursive: true });
+  }
+};
+
 const main = async () => {
   try {
-    let archivePath = program.args[0];
-    
-    if (!archivePath) {
-      archivePath = await promptUser('Please provide the path to your Twitter archive zip file:');
+    let inputPath = program.args[0];
+    let options = program.opts();
+    const isJsonFile = options.json;
+
+    if (!inputPath) {
+      const promptMessage = isJsonFile
+        ? 'Please provide the path to your JSON file of tweets:'
+        : 'Please provide the path to your Twitter archive zip file:';
+      inputPath = await promptUser(promptMessage);
     }
 
-    let projectCache = loadProjectCache(archivePath) || {};
-    
-    projectCache = await resumeOrStartNewSession(projectCache, archivePath);
-    
+    let projectCache = isJsonFile ? {} : loadProjectCache(inputPath) || {};
+
+    // Set model based on command line flags first
+    if (options.openai) {
+      projectCache.model = 'openai';
+    } else if (options.claude) {
+      projectCache.model = 'claude';
+    }
+
+    // Get account data first
+    if (!projectCache.accountData) {
+      projectCache.accountData = await promptForAccountData();
+      clearCache(inputPath);
+    }
+
+    // Skip model prompt in resumeOrStartNewSession if we already have it
+    if (!projectCache.unfinishedSession) {
+      projectCache.unfinishedSession = {
+        currentChunk: 0,
+        totalChunks: 0,
+        completed: false
+      };
+      projectCache.basicUserInfo = await promptUser('Enter additional user info that might help the summarizer: ');
+    }
+
+    // Debug logging
+    console.log('Debug: Account Data:', JSON.stringify(projectCache.accountData, null, 2));
+    console.log('Debug: Model:', projectCache.model);
+
     const apiKey = await getApiKey(projectCache.model);
     if (!apiKey) {
       throw new Error(`Failed to get a valid API key for ${projectCache.model}`);
     }
     process.env[`${projectCache.model.toUpperCase()}_API_KEY`] = apiKey;
 
-    saveProjectCache(archivePath, projectCache);
+    if (!isJsonFile) {
+      saveProjectCache(inputPath, projectCache);
+    }
 
     const progressBar = new cliProgress.SingleBar({}, cliProgress.Presets.shades_classic);
     progressBar.start(projectCache.unfinishedSession.totalChunks || 100, projectCache.unfinishedSession.currentChunk || 0);
 
     await safeExecute(async () => {
-      const zip = new StreamZip.async({ file: archivePath });
+      let accountData;
+      let tweets;
 
-      try {
-        const accountData = JSON.parse((await readFileFromZip(zip, 'data/account.js')).replace('window.YTD.account.part0 = ', ''));
-
-        const tweets = JSON.parse((await readFileFromZip(zip, 'data/tweets.js')).replace('window.YTD.tweets.part0 = ', ''))
-          .map((item) => item.tweet)
-          .filter((tweet) => !tweet.retweeted);
-
-        const chunks = await chunkText(tweets, accountData, archivePath);
-
-        projectCache.unfinishedSession.totalChunks = chunks.length;
-        progressBar.setTotal(chunks.length);
-        const tasks = chunks.map((chunk, index) => async () => {
-          if (index < projectCache.unfinishedSession.currentChunk) {
-            return null; // Skip already processed chunks
+      if (isJsonFile) {
+        const jsonContent = fs.readFileSync(inputPath, 'utf8');
+        const jsonTweets = JSON.parse(jsonContent);
+        tweets = jsonTweets;
+        // Ensure accountData has the correct structure
+        accountData = [{
+          account: {
+            accountDisplayName: projectCache.accountData.accountDisplayName,
+            username: projectCache.accountData.username
           }
-          const result = await extractInfo(accountData, chunk, index, archivePath, projectCache.model);
-          projectCache.unfinishedSession.currentChunk = index + 1;
-          progressBar.update(projectCache.unfinishedSession.currentChunk);
-          saveProjectCache(archivePath, projectCache);
-          return result;
-        });
-        const results = await limitConcurrency(tasks, 3); // Process 3 chunks concurrently
+        }];
 
-        const validResults = results.filter(result => result !== null);
-        const combined = combineAndDeduplicate(validResults);
-
-        const character = {
-          name: accountData[0].account.accountDisplayName,
-          ...combined,
-        };
-
-        saveCharacterData(character);
-
-        return character;
-      } finally {
-        await zip.close();
+        // Debug logging
+        console.log('Debug: Processed Account Data:', JSON.stringify(accountData, null, 2));
+      } else {
+        // Handle zip file
+        const zip = new StreamZip.async({ file: inputPath });
+        try {
+          // For zip files, still allow overriding with prompted data if it exists
+          if (projectCache.accountData) {
+            accountData = [{
+              account: projectCache.accountData
+            }];
+          } else {
+            accountData = JSON.parse((await readFileFromZip(zip, 'data/account.js')).replace('window.YTD.account.part0 = ', ''));
+          }
+          tweets = JSON.parse((await readFileFromZip(zip, 'data/tweets.js')).replace('window.YTD.tweets.part0 = ', ''))
+            .map((item) => item.tweet)
+            .filter((tweet) => !tweet.retweeted);
+        } finally {
+          await zip.close();
+        }
       }
+
+      const chunks = await chunkText(tweets, accountData, inputPath);
+
+      projectCache.unfinishedSession.totalChunks = chunks.length;
+      progressBar.setTotal(chunks.length);
+      const tasks = chunks.map((chunk, index) => async () => {
+        if (index < projectCache.unfinishedSession.currentChunk) {
+          return null; // Skip already processed chunks
+        }
+        const result = await extractInfo(accountData, chunk, index, inputPath, projectCache.model);
+        projectCache.unfinishedSession.currentChunk = index + 1;
+        progressBar.update(projectCache.unfinishedSession.currentChunk);
+        if (!isJsonFile) {
+          saveProjectCache(inputPath, projectCache);
+        }
+        return result;
+      });
+      const results = await limitConcurrency(tasks, 3); // Process 3 chunks concurrently
+
+      const validResults = results.filter(result => result !== null);
+      const combined = combineAndDeduplicate(validResults);
+
+      const character = {
+        name: projectCache.accountData.accountDisplayName,
+        username: projectCache.accountData.username,
+        ...combined,
+      };
+
+      saveCharacterData(character);
+
+      return character;
     }, 'Error generating character JSON');
 
     progressBar.stop();
 
     projectCache.unfinishedSession.completed = true;
-    saveProjectCache(archivePath, projectCache);
-    clearGenerationCache(archivePath);
+    if (!isJsonFile) {
+      saveProjectCache(inputPath, projectCache);
+      clearGenerationCache(inputPath);
+    }
   } catch (error) {
     console.error('Error during script execution:', error);
+    console.error('Debug: Full error details:', error.stack);
     process.exit(1);
   }
 };

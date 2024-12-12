@@ -1,4 +1,15 @@
-export const prompt = (name, username, basicUserInfo, chunk) => `Here is an example of the output for another character, Eliza:
+export const prompt = (name, username, basicUserInfo, chunk) => {
+  // Add debug logging
+  console.log('Debug prompt.js - Received values:', {
+    name,
+    username,
+    basicUserInfo: basicUserInfo?.substring(0, 50) + '...', // Truncate for readability
+    chunkLength: chunk?.length || 0
+  });
+  console.log("name: {$name}");
+
+  // Rest of your prompt template
+  return `Here is an example of the output for another character, Eliza:
 \`\`\`json
 {
   "bio": [
@@ -186,3 +197,4 @@ Respond with a JSON object containing the extracted information. Wrap the JSON i
 \`\`\`
 The fields that must be included in the response are name, bio, lore, adjectives, topics, style.all, style.chat, style.post, messageExamples and postExamples.
 Make sure to ignore any information from other users and focus exclusively on analyzing the data created by ${name}.`;
+};
